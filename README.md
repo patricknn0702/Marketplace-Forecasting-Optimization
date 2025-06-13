@@ -1,4 +1,4 @@
-# Marketplace-Forecasting-Optimization
+# R-Food Delivery & Ride Hailing-Forecasting Demand-Marketplace Optimization 
 Forecasted demand and optimized investment strategy for GrabFood Vietnam using regression and time series modeling. Identified high-performing merchant categories and proposed actionable reallocations to improve booking efficiency and GMV growth.
 
 # 📦 Grab Vietnam – Demand Forecasting & Investment Optimization
