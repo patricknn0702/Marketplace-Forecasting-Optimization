@@ -1,0 +1,757 @@
+---
+title: "GrabFood Case"
+author: "Patrick nguyen"
+date: "2025-04-25"
+output:
+  html_document: default
+  word_document: default
+---
+#IMPORTING LIBRARIES
+```{r}
+# 📦 Load all required packages
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(janitor)
+
+library(ggplot2)
+library(scales)
+library(hrbrthemes)
+library(ggrepel)
+library(ggthemes)
+library(patchwork)
+
+library(readxl)
+library(formattable)
+library(gt)
+library(DT)
+
+library(broom)
+library(car)
+library(forecast)
+library(tseries)
+
+library(lpSolve)
+library(treemapify)
+
+```
+### DEMAND FORECAST CASE
+## PAT1:DATA CLEANING & FEATURE ENGINEERING
+# 1.1 Load raw data
+```{r}
+df_raw <- read_excel("Case Study_ IMS Growth Specialist_Assessment.xlsx",sheet = "Assessment 1 - Forecasting",skip = 18)
+```
+# 1.2 Clean raw data
+```{r}
+df <- df_raw %>% 
+  clean_names() %>% 
+  rename(category = account)
+# ⚙️ Create AOV inside df before summarizing
+df <- df %>%
+  mutate(
+    AOV = if_else(booking > 0, gmv / booking, NA_real_)  # ✅ Create AOV (Average Order Value)
+  )
+
+```
+# 1.3 Formt Numeric Column
+```{r}
+# Remove commas and convert fields to numeric
+numeric_cols <- c("active_mex", "booking", "completed", 
+                  "gmv", "grossbilling", "mex_spend", "grab_spend")
+
+df <- df %>%
+  mutate(across(all_of(numeric_cols), ~ as.numeric(gsub(",", "", as.character(.)))))
+
+```
+# 1.4 Create New Features
+```{r}
+# Feature engineering: new KPIs
+df <- df %>%
+  mutate(
+    week = as.Date(week),
+    month = month(week, label = TRUE),
+    week_in_year = isoweek(week),
+    week_in_month = ceiling(day(week) / 7),
+    
+    # Business Metrics
+    total_spend = grab_spend + mex_spend,
+    ROI = if_else(total_spend > 0, gmv / total_spend, NA_real_),
+    CP_BO = if_else(booking > 0, total_spend / booking, NA_real_),
+    CP_CO = if_else(completed > 0, total_spend / completed, NA_real_),
+    Fulfillment_Rate = if_else(booking > 0, completed / booking, NA_real_),
+    avg_booking_per_mex = if_else(active_mex > 0, booking / active_mex, NA_real_)
+  )
+```
+##PART 2: WEEKLY DEMAND TREND ANALYSIS
+
+# 2.1 Weekly Aggregation
+```{r}
+# 📊 Summarize weekly performance
+weekly_trend <- df %>%
+  group_by(week, week_in_year) %>%
+  summarise(
+    Booking = sum(booking, na.rm = TRUE),
+    Spend = sum(total_spend, na.rm = TRUE),
+    GMV = sum(gmv, na.rm = TRUE),
+    ROI = sum(gmv, na.rm = TRUE) / sum(total_spend, na.rm = TRUE),
+    avg_booking_per_mex = mean(avg_booking_per_mex, na.rm = TRUE),
+    Fulfillment_Rate = mean(Fulfillment_Rate, na.rm = TRUE),
+    CP_BO = mean(CP_BO, na.rm = TRUE),
+    CP_CO = mean(CP_CO, na.rm = TRUE),
+    AOV = mean(AOV, na.rm = TRUE),        # ✅ Now safe to summarize AOV
+    .groups = "drop"
+  ) %>%
+  mutate(
+    Spend = round(Spend, 0),
+    GMV = round(GMV, 0),
+    Booking = round(Booking, 0),
+    ROI = round(ROI, 2),
+    avg_booking_per_mex = round(avg_booking_per_mex, 2),
+    Fulfillment_Rate = round(Fulfillment_Rate, 2),
+    CP_BO = round(CP_BO, 2),
+    CP_CO = round(CP_CO, 2),
+    AOV = round(AOV, 2)
+  )
+```
+#2.2 Plot Combo Chart to spot trend
+```{r}
+# 👇 Convert week_in_year to numeric for proper timeline spacing
+weekly_trend <- weekly_trend %>%
+  mutate(week_numeric = as.numeric(week_in_year))
+
+# Recalculate scaling factor (still needed)
+scaling_factor <- max(weekly_trend$Spend, na.rm = TRUE) / max(weekly_trend$ROI, na.rm = TRUE)
+
+# ✅ Updated ggplot with correct week axis
+ggplot(weekly_trend, aes(x = week_numeric)) +
+
+  # 1️⃣ Area Chart for Booking Orders
+  geom_area(aes(y = Booking, fill = "Booking Order"), alpha = 0.5) +
+
+  # 2️⃣ Bar Chart for Total Spend
+  geom_col(aes(y = Spend, fill = "Total Spend"), alpha = 0.8) +
+
+  # 3️⃣ Line Chart for ROI (scaled)
+  geom_line(aes(y = ROI * scaling_factor, color = "ROI"), size = 1.5) +
+
+  # 4️⃣ ROI Labels
+  geom_text(aes(y = ROI * scaling_factor + 10000, label = round(ROI, 2)), 
+            color = "darkgrey", size = 4, fontface = "bold") +
+
+  # 5️⃣ Trend Lines
+  geom_smooth(aes(y = Booking, color = "Booking Order Trend"), method = "lm", se = FALSE, linetype = "dotted") +
+  geom_smooth(aes(y = Spend, color = "Total Spend Trend"), method = "lm", se = FALSE, linetype = "dotted") +
+
+  # 🏷 Labels
+  labs(
+    title = "Demand Trend by Week",
+    x = "Week in Year",
+    y = NULL,
+    caption = "ROI is shown on the secondary axis\nDotted lines represent linear trends"
+  ) +
+
+  # 🎨 Colors
+  scale_fill_manual(values = c("Booking Order" = "yellow", "Total Spend" = "black")) +
+  scale_color_manual(values = c(
+    "ROI" = "orange",
+    "Booking Order Trend" = "red",
+    "Total Spend Trend" = "green"
+  )) +
+
+  # 🪄 Fix Y-axis + Dual ROI axis
+  scale_y_continuous(
+    labels = scales::comma,
+    sec.axis = sec_axis(~ . / scaling_factor, name = NULL, labels = comma)
+  ) +
+
+  # ✅ Fix X-axis: show each week cleanly
+  scale_x_continuous(
+    breaks = weekly_trend$week_numeric,
+    labels = weekly_trend$week_in_year
+  ) +
+
+  # ✨ Clean theme
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold", size = 16),
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    axis.text.x = element_text(angle = 0, vjust = 0.5, hjust = 0.5),  # 👉 Weeks stand upright
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank()
+  )
+```
+## PART3: L3W Deepdive by Segment Analysis
+#3.1 Filter Data to Weeks 47-49
+```{r}
+# 📚 Load libraries
+library(dplyr)
+library(scales)
+library(formattable)
+
+# 📊 Step 1: Create main pivot without subtotal
+pivot_main <- df %>%
+  filter(week_in_year %in% c(47, 48, 49)) %>%
+  select(category, week_in_year, active_mex, total_spend, booking) %>%
+  arrange(category, week_in_year) %>%
+  group_by(category) %>%
+  mutate(
+    pct_change_active_mex = (active_mex / lag(active_mex) - 1) * 100,
+    pct_change_spent = (total_spend / lag(total_spend) - 1) * 100,
+    pct_change_booking = (booking / lag(booking) - 1) * 100,
+    avg_booking_per_mex = booking / active_mex,
+    pct_change_avg_demand_mex = (avg_booking_per_mex / lag(avg_booking_per_mex) - 1) * 100
+  ) %>%
+  mutate(across(starts_with("pct_change"), ~ replace_na(.x, 0))) %>%
+  rename(Time = week_in_year) %>%
+  mutate(Time = factor(Time, levels = c(47, 48, 49))) %>%
+  ungroup()
+
+# 📊 Step 2: Split by category and add subtotal after each category
+pivot_list <- pivot_main %>%
+  group_split(category)
+
+pivot_final <- lapply(pivot_list, function(group_df) {
+  subtotal <- group_df %>%
+    summarise(
+      category = unique(category),
+      Time = "Subtotal",
+      active_mex = sum(active_mex, na.rm = TRUE),
+      total_spend = sum(total_spend, na.rm = TRUE),
+      booking = sum(booking, na.rm = TRUE),
+      avg_booking_per_mex = sum(booking, na.rm = TRUE) / sum(active_mex, na.rm = TRUE),
+      pct_change_active_mex = NA,
+      pct_change_spent = NA,
+      pct_change_booking = NA,
+      pct_change_avg_demand_mex = NA,
+      .groups = "drop"
+    )
+  bind_rows(group_df, subtotal)
+}) %>%
+  bind_rows() %>%
+  select(
+    category, Time,
+    active_mex, total_spend, booking, avg_booking_per_mex,
+    pct_change_active_mex, pct_change_spent, pct_change_booking, pct_change_avg_demand_mex
+  )
+
+# 📋 Step 3: Format number and percentage
+pivot_table <- pivot_final %>%
+  mutate(
+    active_mex = comma(round(active_mex, 0)),
+    total_spend = comma(round(total_spend, 0)),
+    booking = comma(round(booking, 0)),
+    avg_booking_per_mex = round(avg_booking_per_mex, 2),
+    pct_change_active_mex = sprintf("%.1f%%", pct_change_active_mex),
+    pct_change_spent = sprintf("%.1f%%", pct_change_spent),
+    pct_change_booking = sprintf("%.1f%%", pct_change_booking),
+    pct_change_avg_demand_mex = sprintf("%.1f%%", pct_change_avg_demand_mex)
+  )
+
+# 🎨 Step 4: Define color scales
+color_scale_active_mex <- function(x) {
+  color_tile("yellow", "green")(as.numeric(x))
+}
+color_scale_spent <- function(x) {
+  color_tile("green", "yellow")(as.numeric(x))
+}
+color_scale_booking <- function(x) {
+  color_tile("yellow", "green")(as.numeric(x))
+}
+color_scale_avg_demand_mex <- function(x) {
+  color_tile("yellow", "green")(as.numeric(x))
+}
+
+# 🎯 Step 5: Apply color formatting
+pivot_table_formatted <- pivot_table %>%
+  group_by(category) %>%
+  mutate(
+    pct_change_active_mex = color_scale_active_mex(gsub("%", "", pct_change_active_mex)),
+    pct_change_spent = color_scale_spent(gsub("%", "", pct_change_spent)),
+    pct_change_booking = color_scale_booking(gsub("%", "", pct_change_booking)),
+    pct_change_avg_demand_mex = color_scale_avg_demand_mex(gsub("%", "", pct_change_avg_demand_mex))
+  ) %>%
+  ungroup()
+
+# 📋 Step 6: Display final pivot heatmap
+formattable(pivot_table_formatted)
+
+```
+#3.2 Export the heatmap into PNG
+```{r}
+install.packages("webshot2")
+
+library(formattable)
+library(htmlwidgets)
+library(webshot2)  # Install with: install.packages("webshot2")
+
+# Save the HTML widget to a temporary HTML file
+saveWidget(as.htmlwidget(formattable(pivot_table_formatted)), "pivot_heatmap.html", selfcontained = TRUE)
+
+# Take a screenshot of the HTML file and save as PNG
+webshot("pivot_heatmap.html", 
+        "pivot_heatmap_fixed.png", 
+        zoom = 2, 
+        vwidth = 1600, 
+        vheight = 1800)  # Increase height significantly
+
+
+```
+
+
+## PART4: Multiple Regression Model
+# 4.1 Prepare the Clean Dataset for Regression
+```{r}
+# 🧹 Step 1.1: Select necessary columns for modeling
+regression_data <- df %>%
+  select(category, week_in_year, booking, total_spend, active_mex, ROI, Fulfillment_Rate) %>%
+  filter(!is.na(booking), !is.na(total_spend), !is.na(active_mex))  # Remove missing rows if any
+
+# 🏷️ Step 1.2: Create Dummy Variables for Category
+regression_data <- regression_data %>%
+  mutate(
+    A2_dummy = if_else(category == "A2", 1, 0),
+    A3_dummy = if_else(category == "A3", 1, 0),
+    A4_dummy = if_else(category == "A4", 1, 0)
+    # (A1 is the baseline, no dummy needed)
+  )
+
+# 🧹 Step 1.3: Optional — Check glimpse of the cleaned dataset
+glimpse(regression_data)
+
+```
+# 4.2 Correlation Matrix
+```{r}
+# 📊 Step 2.1: Select only numerical columns for correlation
+correlation_data <- regression_data %>%
+  select(booking, total_spend, active_mex, ROI, Fulfillment_Rate)
+
+# 📈 Step 2.2: Compute Correlation Matrix
+correlation_matrix <- cor(correlation_data, use = "complete.obs")
+
+# 🖼️ Step 2.3: Visualize Correlation Matrix
+library(corrplot)
+
+# Basic Corrplot
+corrplot(
+  correlation_matrix,
+  method = "color",       # Show color tiles
+  type = "upper",         # Only upper half
+  addCoef.col = "black",  # Add correlation coefficients
+  number.cex = 0.7,       # Size of correlation numbers
+  tl.col = "black",       # Text labels color
+  tl.srt = 45             # Rotate labels
+)
+
+```
+#cmt>> multicollinear of active_mex & spending >> take out
+
+#4.3 Finetune Regression Model with catagorical variables
+# Regression Formula: booking ~ total_spend + A2 + A3 + A4
+```{r}
+# 📚 Load necessary libraries
+library(dplyr)
+library(broom)
+
+# ⚙️ Step 1: Prepare the clean dataset
+# Assume `df` is your main dataset already cleaned previously
+
+# Create dummy variables for A2, A3, A4 (A1 is baseline)
+df_model <- df %>%
+  filter(week_in_year %in% c(47, 48, 49)) %>%  # Focus on L3W (week 47-49)
+  mutate(
+    A2 = if_else(category == "A2", 1, 0),
+    A3 = if_else(category == "A3", 1, 0),
+    A4 = if_else(category == "A4", 1, 0)
+  ) %>%
+  select(booking, total_spend, A2, A3, A4)
+
+# ✅ Step 2: Build the Regression Model
+model_booking <- lm(booking ~ total_spend + A2 + A3 + A4, data = df_model)
+
+# 📋 Step 3: Output the Summary
+summary(model_booking)
+
+# 📋 Step 4: Optional — Pretty tidy summary for report
+model_booking_tidy <- broom::tidy(model_booking)
+print(model_booking_tidy)
+
+# 📊 Step 5: Optional — Check R-squared, Adjusted R-squared
+model_stats <- broom::glance(model_booking)
+print(model_stats)
+
+# 📍 Interpretation Hints:
+# - Coefficients: Positive/negative impact
+# - p-value < 0.05 = statistically significant impact
+# - R-squared: Overall model fit
+
+# 🚀 Now we can interpret: Which category (A2/A3/A4) matters most!
+
+```
+
+## PART5: Forecasting Model for 6 weeks (AIRMA & Econometric)
+#5.1 Forecast Booking based on 2 model (econometrics is more reliable)
+```{r}
+# 📚 Load libraries
+library(dplyr)
+library(forecast)
+library(tidyr)
+library(broom)
+library(ggplot2)
+
+# ⚙️ Assume your data 'df_model' already has:
+# Columns: booking, total_spend, A2, A3, A4
+
+# ==========================================================
+# 1️⃣ ECONOMETRIC FORECASTING (Regression-based Prediction)
+# ==========================================================
+
+# Fit regression model
+model_reg <- lm(booking ~ total_spend + A2 + A3 + A4, data = df_model)
+
+# View model summary
+summary(model_reg)
+
+# Forecast next 6 weeks:
+# (You need to simulate future spend and A2, A3, A4 flags)
+
+# Example: Create new input assumptions
+future_input <- data.frame(
+  total_spend = c(1500000, 1550000, 1600000, 1650000, 1700000, 1750000),   # Forecasted spend
+  A2 = c(0, 0, 0, 0, 0, 0),   # Category flags
+  A3 = c(1, 1, 1, 1, 1, 1),
+  A4 = c(0, 0, 0, 0, 0, 0)
+)
+
+# Predict Booking for future
+booking_forecast_reg <- predict(model_reg, newdata = future_input)
+
+# Create final Econometric Forecast Table
+econometric_forecast <- future_input %>%
+  mutate(
+    forecasted_booking = round(booking_forecast_reg)
+  )
+
+print(econometric_forecast)
+
+# ==========================================================
+# 2️⃣ TIME SERIES FORECASTING (ARIMA model)
+# ==========================================================
+
+# Create time series object from booking
+booking_ts <- ts(df_model$booking, frequency = 1)
+
+# Fit ARIMA model automatically
+model_arima <- auto.arima(booking_ts)
+
+# View model summary
+summary(model_arima)
+
+# Forecast 6 steps ahead
+forecast_arima <- forecast(model_arima, h = 6)
+
+# Convert to dataframe
+arima_forecast <- data.frame(
+  Week = seq_len(6),
+  Forecasted_Booking = round(forecast_arima$mean),
+  Lower_80 = round(forecast_arima$lower[,1]),
+  Upper_80 = round(forecast_arima$upper[,1])
+)
+
+print(arima_forecast)
+
+# ==========================================================
+# 3️⃣ VISUALIZE COMPARISON
+# ==========================================================
+
+# Combine both results
+combined_forecast <- data.frame(
+  Week = seq(1,6),
+  Booking_Econometric = econometric_forecast$forecasted_booking,
+  Booking_ARIMA = arima_forecast$Forecasted_Booking
+)
+
+# Plot
+ggplot(combined_forecast, aes(x = Week)) +
+  geom_line(aes(y = Booking_Econometric, color = "Econometric"), size = 1.2) +
+  geom_line(aes(y = Booking_ARIMA, color = "ARIMA"), size = 1.2, linetype = "dashed") +
+  geom_point(aes(y = Booking_Econometric, color = "Econometric"), size = 2) +
+  geom_point(aes(y = Booking_ARIMA, color = "ARIMA"), size = 2) +
+  labs(
+    title = "Booking Forecast: Econometric vs ARIMA",
+    x = "Future Week",
+    y = "Booking Orders",
+    color = "Model"
+  ) +
+  theme_minimal(base_size = 14)
+
+```
+#5.2 Forcecast for GMV, spend, ROI (case base without budget reallocation)
+```{r}
+# 📚 Load libraries
+library(dplyr)
+library(ggplot2)
+
+# 📊 Step 1: Assume Last Week Spend by Category
+spend_last_week <- tibble(
+  category = c("A1", "A2", "A3", "A4"),
+  spend = c(370000, 320000, 330000, 380000)  # Example values
+)
+
+# 📋 Step 2: Reallocate Budget based on New Strategy
+reallocation_plan <- tibble(
+  category = c("A1", "A2", "A3", "A4"),
+  adjustment = c(-0.10, -0.03, 0.15, -0.10)  # Cut or Boost
+)
+
+# Calculate new spend
+spend_reallocated <- spend_last_week %>%
+  left_join(reallocation_plan, by = "category") %>%
+  mutate(new_spend = spend * (1 + adjustment))
+
+# Normalize to make total spend same as original
+total_original_spend <- sum(spend_last_week$spend)
+total_new_spend <- sum(spend_reallocated$new_spend)
+scaling_factor <- total_original_spend / total_new_spend
+
+spend_reallocated <- spend_reallocated %>%
+  mutate(final_spend = new_spend * scaling_factor)
+
+# 🧮 Step 3: Assumptions for AOV, CPBO, Fulfillment Rate
+future_plan <- tibble(
+  week = 1:6,
+  AOV = c(12.0, 12.2, 12.3, 12.4, 12.5, 12.6),  # Example slight growth
+  CPBO = c(0.90, 0.92, 0.93, 0.94, 0.95, 0.96),
+  fulfillment_rate = c(0.92, 0.92, 0.91, 0.91, 0.91, 0.90)
+)
+
+# 🏗 Step 4: Forecast Booking Orders
+# Regression coefficients (from your earlier regression)
+coef_spend <- -0.105
+coef_A2 <- -136400
+coef_A3 <- 461500
+coef_A4 <- -454700
+
+# Assume we boost A3 and reduce others as per reallocated budget
+future_forecast <- future_plan %>%
+  mutate(
+    total_spend = total_original_spend,  # Assume total spend kept same
+    # Booking from regression model
+    booking = (coef_spend * total_spend) + 
+              (coef_A2 * 0) +   # Assume A2 kept neutral
+              (coef_A3 * 1) +   # Push A3
+              (coef_A4 * 0) +   # Cut A4
+              491500,           # Intercept
+    booking = pmax(booking, 0)  # Avoid negative booking
+  )
+
+# Step 5: Forecast GMV, Completed Orders, ROI
+future_forecast <- future_forecast %>%
+  mutate(
+    GMV = booking * AOV,
+    completed_orders = booking * fulfillment_rate,
+    ROI = GMV / total_spend
+  )
+
+# 📈 Step 6: Plot GMV and ROI Forecast
+p <- ggplot(future_forecast, aes(x = week)) +
+  geom_line(aes(y = GMV/1e6, color = "GMV ($M)"), size = 1.2) +
+  geom_line(aes(y = ROI * 5, color = "ROI (scaled)"), linetype = "dashed", size = 1.2) +
+  scale_y_continuous(
+    name = "GMV ($M)",
+    sec.axis = sec_axis(~./5, name = "ROI")
+  ) +
+  scale_color_manual(values = c("GMV ($M)" = "blue", "ROI (scaled)" = "red")) +
+  labs(
+    title = "Forecast under Reallocation toward A3",
+    x = "Week",
+    color = "Metric"
+  ) +
+  theme_minimal()
+
+# ✨ Output Forecast Table and Plot
+print(future_forecast)
+print(p)
+
+```
+#5.3 Adjust Forcecast for GMV, spend, ROI (based on domain knwoledge of changes range in real life business)
+```{r}
+# 📦 Load necessary libraries
+library(dplyr)
+library(tibble)
+
+# 📊 1. Baseline Fix Scenario
+baseline_fix <- tibble(
+  week = 50:55,
+  booking = rep(806000, 6),
+  AOV = c(12.0, 12.2, 12.3, 12.4, 12.5, 12.6),
+  CPBO = c(0.90, 0.92, 0.93, 0.94, 0.95, 0.96),
+  fulfillment_rate = c(0.92, 0.92, 0.91, 0.91, 0.91, 0.90),
+  total_spend = rep(1400000, 6)
+) %>%
+  mutate(
+    completed_orders = round(booking * fulfillment_rate),
+    GMV = round(booking * AOV),
+    ROI = round(GMV / total_spend, 2)
+  )
+
+# 📊 2. Optimized Reallocation Scenario
+optimized <- tibble(
+  week = 50:55,
+  booking = rep(832000, 6),  # Adjusted upward from regression result
+  AOV = c(12.0, 12.2, 12.3, 12.4, 12.5, 12.6),
+  CPBO = c(0.90, 0.92, 0.93, 0.94, 0.95, 0.96),
+  fulfillment_rate = c(0.92, 0.92, 0.91, 0.91, 0.91, 0.90),
+  total_spend = rep(1400000, 6)
+) %>%
+  mutate(
+    completed_orders = round(booking * fulfillment_rate),
+    GMV = round(booking * AOV),
+    ROI = round(GMV / total_spend, 2)
+  )
+
+# ✅ View Results
+cat("📘 Baseline Fix:\n")
+print(baseline_fix)
+
+cat("\n📗 Optimized Reallocation:\n")
+print(optimized)
+
+```
+#5.4 Final forecast model & result
+```{r}
+# 📚 Load necessary libraries
+library(dplyr)
+library(formattable)
+
+# 📊 Historical spend and assumptions (Weeks 46–49)
+historical_spend <- c(1537401, 1594337, 1709213, 1759203)
+
+# 🔧 Build baseline scenario using historical spend
+baseline_forecast <- data.frame(
+  week = 50:55,
+  total_spend = c(historical_spend, rep(mean(historical_spend), 2)),
+  AOV = c(12.0, 12.2, 12.3, 12.4, 12.5, 12.6),
+  CPBO = c(0.90, 0.92, 0.93, 0.94, 0.95, 0.96),
+  fulfillment_rate = c(0.92, 0.92, 0.91, 0.91, 0.91, 0.90)
+)
+
+baseline_forecast <- baseline_forecast %>%
+  mutate(
+    booking = round(total_spend / CPBO),
+    completed_orders = round(booking * fulfillment_rate),
+    GMV = round(completed_orders * AOV),
+    ROI = round(GMV / total_spend, 2)
+  )
+
+# 🌱 Optimized scenario: Assume same spend but better allocation (+3% uplift in booking)
+optimized_forecast <- baseline_forecast %>%
+  mutate(
+    booking = round(booking * 1.03),
+    completed_orders = round(booking * fulfillment_rate),
+    GMV = round(completed_orders * AOV),
+    ROI = round(GMV / total_spend, 2)
+  )
+# Add scenario label to each dataset
+baseline_forecast <- baseline_forecast %>%
+  mutate(Scenario = "Baseline Fix")
+
+optimized_forecast <- optimized_forecast %>%
+  mutate(Scenario = "Optimized Reallocation")
+
+# Print each table clearly
+cat("\n📘 Baseline Forecast Table:\n")
+print(baseline_forecast)
+
+cat("\n📗 Optimized Reallocation Forecast Table:\n")
+print(optimized_forecast)
+
+
+```
+
+### PROMOTION CASE
+## PART6: Promotion Scenario Optimization Model
+## PART7: Decision Making Model
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
